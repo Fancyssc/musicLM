@@ -207,16 +207,51 @@ class GEGLU(nn.Module):
         x, gate = x.chunk(2, dim = -1)
         return F.gelu(gate) * x
 
-def FeedForward(dim, mult = 4, dropout = 0.):
-    dim_hidden = int(dim * mult * 2 / 3)
+# def FeedForward(dim, mult = 4, dropout = 0.):
+#     dim_hidden = int(dim * mult * 2 / 3)
+#
+#     return nn.Sequential(
+#         LayerNorm(dim),
+#         nn.Linear(dim, dim_hidden * 2, bias = False),
+#         GEGLU(),
+#         nn.Dropout(dropout),
+#         nn.Linear(dim_hidden, dim, bias = False),
+#     )
 
-    return nn.Sequential(
-        LayerNorm(dim),
-        nn.Linear(dim, dim_hidden * 2, bias = False),
-        GEGLU(),
-        nn.Dropout(dropout),
-        nn.Linear(dim_hidden, dim, bias = False)
-    )
+# 输入同样是 T B N C
+class MLP(BaseModule):
+    # Linear -> BN -> LIF -> Linear -> BN -> LIF
+    def __init__(self,in_features,step=4
+                 ,encode_type='direct',hidden_features=None, out_features=None, drop=0.):
+        super().__init__(step=4,encode_type='direct')
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1_linear = nn.Linear(in_features, hidden_features)
+        self.fc1_bn = nn.BatchNorm1d(hidden_features)
+        self.fc1_lif = LIFNode(tau=2.0)
+
+        self.fc2_linear = nn.Linear(hidden_features, out_features)
+        self.fc2_bn = nn.BatchNorm1d(out_features)
+        self.fc2_lif = LIFNode(tau=2.0)
+
+        self.c_hidden = hidden_features
+        self.c_output = out_features
+
+    def forward(self, x):
+        self.reset()
+
+        T,B,N,C = x.shape
+
+        x_ = x.flatten(0, 1) # TB N C
+
+        x = self.fc1_linear(x_)
+        x = self.fc1_bn(x.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, N, self.c_hidden).contiguous() # T B N C
+        x = self.fc1_lif(x.flatten(0,1)).reshape(T, B, N, self.c_hidden)
+
+        x = self.fc2_linear(x.flatten(0,1))
+        x = self.fc2_bn(x.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, N, C).contiguous()
+        x = self.fc2_lif(x.flatten(0,1)).reshape(T, B, N, self.c_output)
+        return x
 
 # attention
 # 可以修改成Spike版本
@@ -262,6 +297,15 @@ class Attention(BaseModule):
         self.proj_lif = LIFNode(tau=2.0, )
 
         self.scale = 0.125
+
+        self.temporal_interactor = nn.Conv1d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1,
+                                             bias=True)
+        self.temporal_interactor_lif = LIFNode(tau=2.0, v_threshold=0.5, layer_by_layer=False, step=1)
+        self.q_temporal_interactor_lif = LIFNode(tau=2.0, v_threshold=0.3, layer_by_layer=False,
+                                                step=1)  # 保证spike-driven
+
+        # self.temporal_interactor_alpha = nn.Parameter(torch.tensor(0.5))
+        self.temporal_interactor_alpha = 0.6
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim, bias = False),
@@ -348,11 +392,48 @@ class Attention(BaseModule):
         v_linear_out = self.v_lif(v_linear_out.flatten(0, 1)).reshape(T, B, N, C)  # TB N C
         v = v_linear_out.reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
 
-        return self.to_out(out)
+        output = []  # 用于保存每个step的注意力
+        q_temporal_interaction = torch.empty_like(q[0])  # 用于保存上一步的q
+
+        for i in range(T):
+            # 1st step
+            if i == 0:
+                attn = (q[i] @ k[i].transpose(-2, -1)) * self.scale
+                attn = attn @ v[i]  # q[i] k[i] v[i] [B, H, N, C/H]
+                q_temporal_interaction = q[i]
+
+                output.append(attn)
+
+            # other steps
+            else:
+                q_temporal_interaction = self.temporal_interactor(q_temporal_interaction.flatten(0, 1)).reshape(B,
+                                                                                                                self.num_heads,
+                                                                                                                N,
+                                                                                                                C // self.num_heads)
+                q_temporal_interaction = self.q_temporal_interactor_lif(
+                    q_temporal_interaction) * self.temporal_interactor_alpha + q[i] * (
+                                                     1 - self.temporal_interactor_alpha)
+                q_temporal_interaction = self.temporal_interactor_lif(q_temporal_interaction)
+
+                attn = (q_temporal_interaction @ k[i].transpose(-2, -1)) * self.scale
+                attn = attn @ v[i]
+
+                output.append(attn)
+
+        output = torch.stack(output)  # output[T, B, H, N, C/H]
+        x = output.transpose(2, 3).reshape(T, B, N, C).contiguous()
+        x = self.attn_lif(x.flatten(0, 1)).reshape(T, B, N, C)  # T B N C
+        x = x.flatten(0, 1)  # TB N C
+
+        x = self.proj_lif(self.proj_bn(self.proj_linear(x).transpose(-1, -2)).transpose(-1, -2)).reshape(T, B, N, C)
+
+        return x # T B N C
 
 # transformer
-# Transformer block中应当完成encode
-class Transformer(nn.Module):
+# Transformer block中应当完成encode t
+# 同时在输出部分应当reshape成 B N C
+
+class Transformer(BaseModule):
 
     def __init__(
         self,
@@ -364,12 +445,13 @@ class Transformer(nn.Module):
         ff_mult = 4,
         ff_dropout = 0.
     ):
-        super().__init__()
+        super().__init__(step=4,encode_type='direct')
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout),
-                FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout),
+                # FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout),
+                MLP(in_features=dim)
             ]))
 
     def forward(
@@ -379,6 +461,9 @@ class Transformer(nn.Module):
         mask = None,
         return_all_layers = False
     ):
+        #direct 编码
+        x = self.encoder(x)
+
         layers = []
 
         for attn, ff in self.layers:
@@ -386,10 +471,11 @@ class Transformer(nn.Module):
             x = ff(x) + x
             layers.append(x)
 
+        # 调整维度 对Step维度取均值
         if not return_all_layers:
-            return x
+            return x.mean(0)
 
-        return x, torch.stack(layers[:-1])
+        return x.mean(0), torch.stack(layers[:-1]).mean(1)
 
 # contrastive losses
 
