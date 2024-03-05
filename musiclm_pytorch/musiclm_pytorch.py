@@ -22,6 +22,101 @@ from einops.layers.torch import Rearrange
 from beartype.typing import List, Optional, Tuple
 from beartype import beartype
 
+
+
+# Braincog导入
+from braincog.model_zoo.base_module import BaseModule
+from braincog.base.node.node import *
+from braincog.base.connection.layer import *
+from braincog.base.strategy.surrogate import *
+
+
+# 神经元建立
+# 复刻Spikformer
+class BaseNode(BaseNode):
+    def __init__(self, threshold=0.5, step=4, layer_by_layer=False, mem_detach=False):
+        super().__init__(threshold=threshold, step=step, layer_by_layer=layer_by_layer, mem_detach=mem_detach)
+
+    def rearrange2node(self, inputs):
+        if self.groups != 1:
+            if len(inputs.shape) == 4:
+                outputs = rearrange(inputs, 'b (c t) w h -> t b c w h', t=self.step)
+            elif len(inputs.shape) == 2:
+                outputs = rearrange(inputs, 'b (c t) -> t b c', t=self.step)
+            else:
+                raise NotImplementedError
+
+        elif self.layer_by_layer:
+            if len(inputs.shape) == 4:
+                outputs = rearrange(inputs, '(t b) c w h -> t b c w h', t=self.step)
+
+            # 加入适配Transformer T B N C的rearange2node分支
+            elif len(inputs.shape) == 3:
+                outputs = rearrange(inputs, '(t b) n c -> t b n c', t=self.step)
+            elif len(inputs.shape) == 2:
+                outputs = rearrange(inputs, '(t b) c -> t b c', t=self.step)
+            else:
+                raise NotImplementedError
+
+
+        else:
+            outputs = inputs
+
+        return outputs
+
+    def rearrange2op(self, inputs):
+        if self.groups != 1:
+            if len(inputs.shape) == 5:
+                outputs = rearrange(inputs, 't b c w h -> b (c t) w h')
+            elif len(inputs.shape) == 3:
+                outputs = rearrange(inputs, ' t b c -> b (c t)')
+            else:
+                raise NotImplementedError
+        elif self.layer_by_layer:
+            if len(inputs.shape) == 5:
+                outputs = rearrange(inputs, 't b c w h -> (t b) c w h')
+
+            # 加入适配Transformer T B N C的rearange2op分支
+            elif len(inputs.shape) == 4:
+                outputs = rearrange(inputs, ' t b n c -> (t b) n c')
+            elif len(inputs.shape) == 3:
+                outputs = rearrange(inputs, ' t b c -> (t b) c')
+            else:
+                raise NotImplementedError
+
+        else:
+            outputs = inputs
+
+        return outputs
+
+
+class Grad(SurrogateFunctionBase):
+    def __init__(self, alpha=4., requires_grad=False):
+        super().__init__(alpha, requires_grad)
+
+    @staticmethod
+    def act_fun(x, alpha):
+        return sigmoid.apply(x, alpha)
+
+
+class LIFNode(BaseNode):
+    def __init__(self, threshold=1., step=4, layer_by_layer=True, tau=2., act_fun=Grad, mem_detach=True, *args,
+                 **kwargs):
+        super().__init__(threshold=threshold, step=step, layer_by_layer=layer_by_layer, mem_detach=mem_detach)
+        self.tau = tau
+        if isinstance(act_fun, str):
+            act_fun = eval(act_fun)
+        self.act_fun = act_fun(alpha=4., requires_grad=False)
+
+    def integral(self, inputs):
+        self.mem = self.mem + (inputs - self.mem) / self.tau
+
+    def calc_spike(self):
+        self.spike = self.act_fun(self.mem - self.threshold)
+        self.mem = self.mem * (1 - self.spike.detach())
+
+# 神经元构建完成
+
 # functions
 
 def exists(val):
@@ -124,32 +219,49 @@ def FeedForward(dim, mult = 4, dropout = 0.):
     )
 
 # attention
-
-class Attention(nn.Module):
+# 可以修改成Spike版本
+class Attention(BaseModule):
     def __init__(
         self,
         dim,
+        step=4,
         causal = False,
         dim_head = 64,
         heads = 8,
         dropout = 0.,
         scale = 8
     ):
-        super().__init__()
+        super().__init__(step=4,encode_type='direct')
         self.heads = heads
         self.scale = scale
         self.causal = causal
-        inner_dim = dim_head * heads
+        inner_dim = dim_head * heads  # 512
 
         self.norm = LayerNorm(dim)
 
         self.attn_dropout = nn.Dropout(dropout)
 
-        self.to_q = nn.Linear(dim, inner_dim, bias = False)
-        self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
+        # self.to_q = nn.Linear(dim, inner_dim, bias = False)
+        # self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
 
-        self.q_scale = nn.Parameter(torch.ones(dim_head))
-        self.k_scale = nn.Parameter(torch.ones(dim_head))
+        # self.q_scale = nn.Parameter(torch.ones(dim_head))
+        # self.k_scale = nn.Parameter(torch.ones(dim_head))
+
+        self.q_linear = nn.Linear(dim, inner_dim)
+        self.k_linear = nn.Linear(dim, inner_dim)
+        self.v_linear = nn.Linear(dim, inner_dim)
+
+        self.q_lif = LIFNode(tau=2.0)
+        self.k_lif = LIFNode(tau=2.0)
+        self.v_lif = LIFNode(tau=2.0)
+
+        self.attn_lif = LIFNode(tau=2.0, v_threshold=0.5, )
+
+        self.proj_linear = nn.Linear(dim, dim)
+        self.proj_bn = nn.BatchNorm1d(dim)
+        self.proj_lif = LIFNode(tau=2.0, )
+
+        self.scale = 0.125
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim, bias = False),
@@ -162,59 +274,86 @@ class Attention(nn.Module):
         rel_pos_bias = None,
         mask = None
     ):
-        b, n, _, device = *x.shape, x.device
 
-        # prenorm
+        # b, n, _, device = *x.shape, x.device
+        #
+        # # prenorm
+        #
+        # x = self.norm(x)
+        #
+        # # project for queries, keys, values
+        #
+        # q, k, v = self.to_q(x), *self.to_kv(x).chunk(2, dim = -1)
+        #
+        # # split for multi-headed attention
+        #
+        # q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), (q, k, v))
+        #
+        # # qk rmsnorm, technique circulating within brain used to stabilize a 22B parameter vision model training
+        #
+        # q, k = map(l2norm, (q, k))
+        # q = q * self.q_scale
+        # k = k * self.k_scale
+        #
+        # # similarities
+        #
+        # sim = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        #
+        # if exists(rel_pos_bias):
+        #     sim = sim + rel_pos_bias
+        #
+        # if exists(mask):
+        #     mask = rearrange(mask, 'b j -> b 1 1 j')
+        #     sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
+        #
+        # if self.causal:
+        #     i, j = sim.shape[-2:]
+        #     causal_mask = torch.ones((i, j), dtype = torch.bool, device = x.device).triu(j - i + 1)
+        #     sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
+        #
+        # # attention
+        #
+        # attn = sim.softmax(dim = -1)
+        # attn = self.attn_dropout(attn)
+        #
+        # # aggregate
+        #
+        # out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        #
+        # # merge heads
+        #
+        # out = rearrange(out, 'b h n d -> b n (h d)')
 
-        x = self.norm(x)
 
-        # project for queries, keys, values
+        #输入应该是 T B N C
+        self.reset()
 
-        q, k, v = self.to_q(x), *self.to_kv(x).chunk(2, dim = -1)
+        T,B,N,C = x.shape
 
-        # split for multi-headed attention
+        x_for_qkv = x.flatten(0,1)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), (q, k, v))
+        q_linear_out = self.q_linear(x_for_qkv)  # [TB, N, C]
+        q_linear_out = self.q_bn(q_linear_out.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, N,
+                                                                                           C).contiguous()  # T B N C
+        q_linear_out = self.q_lif(q_linear_out.flatten(0, 1)).reshape(T, B, N, C)  # TB N C
+        q = q_linear_out.reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
 
-        # qk rmsnorm, technique circulating within brain used to stabilize a 22B parameter vision model training
+        k_linear_out = self.k_linear(x_for_qkv)
+        k_linear_out = self.k_bn(k_linear_out.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, N, C).contiguous()
+        k_linear_out = self.k_lif(k_linear_out.flatten(0, 1)).reshape(T, B, N, C)  # TB N C
+        k = k_linear_out.reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
 
-        q, k = map(l2norm, (q, k))
-        q = q * self.q_scale
-        k = k * self.k_scale
+        v_linear_out = self.v_linear(x_for_qkv)
+        v_linear_out = self.v_bn(v_linear_out.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, N, C).contiguous()
+        v_linear_out = self.v_lif(v_linear_out.flatten(0, 1)).reshape(T, B, N, C)  # TB N C
+        v = v_linear_out.reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
 
-        # similarities
-
-        sim = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
-
-        if exists(rel_pos_bias):
-            sim = sim + rel_pos_bias
-
-        if exists(mask):
-            mask = rearrange(mask, 'b j -> b 1 1 j')
-            sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
-
-        if self.causal:
-            i, j = sim.shape[-2:]
-            causal_mask = torch.ones((i, j), dtype = torch.bool, device = x.device).triu(j - i + 1)
-            sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
-
-        # attention
-
-        attn = sim.softmax(dim = -1)
-        attn = self.attn_dropout(attn)
-
-        # aggregate
-
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
-
-        # merge heads
-
-        out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
 
 # transformer
-
+# Transformer block中应当完成encode
 class Transformer(nn.Module):
+
     def __init__(
         self,
         dim,
@@ -393,7 +532,7 @@ class AudioSpectrogramTransformer(nn.Module):
         self.to_patch_tokens = Sequential(
             Rearrange('b (h p1) (w p2) -> b h w (p1 p2)', p1 = self.patch_size[0], p2 = self.patch_size[1]),
             nn.LayerNorm(patch_input_dim),
-            nn.Linear(patch_input_dim, dim),
+            nn.Linear(patch_input_dim, dim),  # b h
             nn.LayerNorm(dim)
         )
 
@@ -411,7 +550,7 @@ class AudioSpectrogramTransformer(nn.Module):
         )
 
         # SpecAugment - seems to be widely used in audio field https://arxiv.org/abs/1904.08779
-
+        #增强 不管
         self.aug = torch.nn.Sequential(
             TimeStretch(spec_aug_stretch_factor, fixed_rate = True),
             FrequencyMasking(freq_mask_param = spec_aug_freq_mask),
@@ -479,7 +618,7 @@ class AudioSpectrogramTransformer(nn.Module):
 
         # to patches
 
-        x = self.to_patch_tokens(x)
+        x = self.to_patch_tokens(x)  # b h w dim
 
         # get number of patches along height and width
 
@@ -522,6 +661,9 @@ class AudioSpectrogramTransformer(nn.Module):
 
         # attention, what else
 
+        #理论上只用改动Transformer block
+        #但是特别需要注意维度对齐
+        #输入B N C
         x, all_layers = self.transformer(x, rel_pos_bias = rel_pos_bias, return_all_layers = True)
 
         # final global average and norm (most recent papers show this is superior to CLS token)
