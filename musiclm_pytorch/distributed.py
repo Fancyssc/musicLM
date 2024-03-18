@@ -4,6 +4,10 @@ from torch.autograd import Function
 import torch.distributed as dist
 
 from einops import rearrange
+from x_clip.x_clip import pad_dim_to
+
+from musiclm_pytorch.trainer import exists
+
 
 # distributed helpers
 
