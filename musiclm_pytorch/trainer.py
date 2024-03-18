@@ -24,7 +24,7 @@ from musiclm_pytorch import MuLaN
 
 from einops import rearrange
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedType
 
 # for automatically routing data emitted from a dataset to keywords of the transformer wrappers
 

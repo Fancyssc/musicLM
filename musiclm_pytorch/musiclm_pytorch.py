@@ -1,9 +1,4 @@
-import math
 from functools import wraps, partial
-
-import torch
-import torch.nn.functional as F
-from torch import nn, einsum
 
 from torchaudio.transforms import Spectrogram, TimeStretch, FrequencyMasking, TimeMasking
 
@@ -11,12 +6,12 @@ from audiolm_pytorch import AudioLM
 from audiolm_pytorch.utils import AudioConditionerBase
 
 import torch.distributed as dist
-from musiclm_pytorch.distributed import AllGather
+from distributed import AllGather
 
 from x_clip.tokenizer import tokenizer
 from vector_quantize_pytorch import ResidualVQ
 
-from einops import rearrange, repeat, reduce, pack, unpack
+from einops import  reduce, pack, unpack
 from einops.layers.torch import Rearrange
 
 from beartype.typing import List, Optional, Tuple
@@ -219,7 +214,7 @@ def FeedForward(dim, mult = 4, dropout = 0.):
     )
 
 # attention
-# 可以修改成Spike版本
+# using spikformer as a substitution
 class Attention(BaseModule):
     def __init__(
         self,
@@ -247,9 +242,14 @@ class Attention(BaseModule):
         # self.q_scale = nn.Parameter(torch.ones(dim_head))
         # self.k_scale = nn.Parameter(torch.ones(dim_head))
 
+
         self.q_linear = nn.Linear(dim, inner_dim)
         self.k_linear = nn.Linear(dim, inner_dim)
         self.v_linear = nn.Linear(dim, inner_dim)
+
+        self.q_bn = nn.BatchNorm1d(dim)
+        self.k_bn = nn.BatchNorm1d(dim)
+        self.v_bn = nn.BatchNorm1d(dim)
 
         self.q_lif = LIFNode(tau=2.0)
         self.k_lif = LIFNode(tau=2.0)
@@ -260,6 +260,15 @@ class Attention(BaseModule):
         self.proj_linear = nn.Linear(dim, dim)
         self.proj_bn = nn.BatchNorm1d(dim)
         self.proj_lif = LIFNode(tau=2.0, )
+
+        self.temporal_interactor = nn.Conv1d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1,
+                                             bias=True)
+        self.temporal_interactor_lif = LIFNode(tau=2.0, v_threshold=0.5, layer_by_layer=False, step=1)
+        self.q_temporal_interactor_lif = LIFNode(tau=2.0, v_threshold=0.3, layer_by_layer=False,
+                                                step=1)  # 保证spike-driven
+
+        # self.temporal_interactor_alpha = nn.Parameter(torch.tensor(0.5))
+        self.temporal_interactor_alpha = 0.6
 
         self.scale = 0.125
 
@@ -328,27 +337,65 @@ class Attention(BaseModule):
         #输入应该是 T B N C
         self.reset()
 
-        T,B,N,C = x.shape
+        T, B, N, C = x.shape
 
         x_for_qkv = x.flatten(0,1)
 
         q_linear_out = self.q_linear(x_for_qkv)  # [TB, N, C]
-        q_linear_out = self.q_bn(q_linear_out.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, N,
-                                                                                           C).contiguous()  # T B N C
+        q_linear_out = self.q_bn(q_linear_out.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, N, C).contiguous()  # T B N C
         q_linear_out = self.q_lif(q_linear_out.flatten(0, 1)).reshape(T, B, N, C)  # TB N C
-        q = q_linear_out.reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
+        q = q_linear_out.reshape(T, B, N, self.heads, C // self.heads).permute(0, 1, 3, 2, 4).contiguous()
 
         k_linear_out = self.k_linear(x_for_qkv)
         k_linear_out = self.k_bn(k_linear_out.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, N, C).contiguous()
         k_linear_out = self.k_lif(k_linear_out.flatten(0, 1)).reshape(T, B, N, C)  # TB N C
-        k = k_linear_out.reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
+        k = k_linear_out.reshape(T, B, N, self.heads, C // self.heads).permute(0, 1, 3, 2, 4).contiguous()
 
         v_linear_out = self.v_linear(x_for_qkv)
         v_linear_out = self.v_bn(v_linear_out.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, N, C).contiguous()
         v_linear_out = self.v_lif(v_linear_out.flatten(0, 1)).reshape(T, B, N, C)  # TB N C
-        v = v_linear_out.reshape(T, B, N, self.num_heads, C // self.num_heads).permute(0, 1, 3, 2, 4).contiguous()
+        v = v_linear_out.reshape(T, B, N, self.heads, C // self.heads).permute(0, 1, 3, 2, 4).contiguous()
 
-        return self.to_out(out)
+        output = []  # 用于保存每个step的注意力
+        q_temporal_interaction = torch.empty_like(q[0])  # 用于保存上一步的q
+
+        # q k v [T, B, H, N, C/H]
+        # temporal interaction
+        for i in range(T):
+            # 1st step
+            if i == 0:
+                attn = (q[i] @ k[i].transpose(-2, -1)) * self.scale
+                attn = attn @ v[i]  # q[i] k[i] v[i] [B, H, N, C/H]
+                q_temporal_interaction = q[i]
+
+                output.append(attn)
+
+            # other steps
+            else:
+                q_temporal_interaction = self.temporal_interactor(q_temporal_interaction.flatten(0, 1).transpose(-1,-2)).reshape(B,
+                                                                                                                self.heads,
+                                                                                                                N,
+                                                                                                                C // self.heads)
+                q_temporal_interaction = self.q_temporal_interactor_lif(
+                    q_temporal_interaction) * self.temporal_interactor_alpha + q[i] * (
+                                                     1 - self.temporal_interactor_alpha)
+                q_temporal_interaction = self.temporal_interactor_lif(q_temporal_interaction)
+
+                attn = (q_temporal_interaction @ k[i].transpose(-2, -1)) * self.scale
+                attn = attn @ v[i]
+
+                output.append(attn)
+
+        output = torch.stack(output)  # output[T, B, H, N, C/H]
+        x = output.transpose(2, 3).reshape(T, B, N, C).contiguous()
+        x = self.attn_lif(x.flatten(0, 1)).reshape(T, B, N, C)  # T B N C
+        x = x.flatten(0, 1)  # TB N C
+
+        x = self.proj_lif(self.proj_bn(self.proj_linear(x).transpose(-1, -2)).transpose(-1, -2)).reshape(T, B, N, C)
+
+        return x  # [T, B, N, C]
+
+
 
 # transformer
 # Transformer block中应当完成encode
@@ -663,8 +710,13 @@ class AudioSpectrogramTransformer(nn.Module):
 
         #理论上只用改动Transformer block
         #但是特别需要注意维度对齐
-        #输入B N C
+        #输入T B N C
+
+        x = (x.unsqueeze(0)).repeat(4, 1, 1, 1)  #默认设置T = 4
+
         x, all_layers = self.transformer(x, rel_pos_bias = rel_pos_bias, return_all_layers = True)
+
+        x = x.mean(0)  # 还原为B N C
 
         # final global average and norm (most recent papers show this is superior to CLS token)
 
@@ -758,9 +810,11 @@ class TextTransformer(nn.Module):
         mask = F.pad(mask, (1, 0), value = True)
 
         # attention
+        x = (x.unsqueeze(0)).repeat(4, 1, 1, 1)  #默认设置T = 4
 
         x, all_layers = self.transformer(x, mask = mask, return_all_layers = True)
 
+        x = x.mean(0)
         # unpack the cls tokens
 
         cls_tokens, _ = unpack(x, ps, 'b * d')
